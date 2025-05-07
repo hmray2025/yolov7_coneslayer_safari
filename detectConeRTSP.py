@@ -219,13 +219,15 @@ class DetectionModel:
         self.conf_threshold = conf_threshold
         self.imgsz = 1280  # Default image size
         self.iou_thres = 0.50
+        self.color_number_threshold = 5
         self.reference_colors = np.array([
             (248, 113, 84),
             (241, 67, 60),
+            (248, 43, 16),
             (252, 64, 29),
             (185, 39, 42),
             (255, 134, 106)], dtype=np.float32)
-        self.threshold = 100
+        self.threshold = 20.0
         logger.info(f"Loading detection model from {model_path}")
         
         try:
@@ -268,36 +270,43 @@ class DetectionModel:
                 _ = self.model(dummy_input)
         
         cuda_code = """
-        __global__ void detect_colors(float *frame, float *ref_colors, float *result, 
-                                     int width, int height, int num_colors, float threshold) {
-            // Calculate pixel position
-            int idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= width * height) return;
-            
-            // Get pixel RGB values
-            float r = frame[idx * 3];
-            float g = frame[idx * 3 + 1];
-            float b = frame[idx * 3 + 2];
-            
-            // Initialize result to 0 (no color match)
-            result[idx] = 0;
-            
-            // Check each reference color
-            for (int c = 0; c < num_colors; c++) {
-                float ref_r = ref_colors[c * 3];
-                float ref_g = ref_colors[c * 3 + 1];
-                float ref_b = ref_colors[c * 3 + 2];
+            __global__ void detect_colors(float *frame, float *ref_colors, float *result, 
+                                         int width, int height, int num_colors, float threshold) {
+                // Calculate pixel position
+                int idx = blockIdx.x * blockDim.x + threadIdx.x;
+                if (idx >= width * height) return;
                 
-                // Calculate Euclidean distance
-                float distance = sqrtf(powf(r - ref_r, 2) + powf(g - ref_g, 2) + powf(b - ref_b, 2));
+                // Get pixel RGB values
+                float r = frame[idx * 3];
+                float g = frame[idx * 3 + 1];
+                float b = frame[idx * 3 + 2];
                 
-                // If distance is less than threshold, mark as match and break
-                if (distance <= threshold) {
-                    result[idx] = c + 1;  // +1 so 0 can mean "no match"
-                    break;
+                // Initialize result to 0 (no color match)
+                result[idx] = 0;
+                
+                float min_distance = threshold + 1.0f;  // Initialize to greater than threshold
+                int best_match = -1;
+                
+                // Check each reference color
+                for (int c = 0; c < num_colors; c++) {
+                    float ref_r = ref_colors[c * 3];
+                    float ref_g = ref_colors[c * 3 + 1];
+                    float ref_b = ref_colors[c * 3 + 2];
+                    
+                    // Calculate Euclidean distance
+                    float distance = sqrtf(powf(r - ref_r, 2) + powf(g - ref_g, 2) + powf(b - ref_b, 2));
+                    
+                    if (distance < min_distance) {
+                        min_distance = distance;
+                        best_match = c;
+                    }
+                }
+                
+                // If we found a match below threshold, mark it
+                if (min_distance <= threshold && best_match >= 0) {
+                    result[idx] = best_match + 1;  // +1 so 0 can mean "no match"
                 }
             }
-        }
         """
         
         self.module = SourceModule(cuda_code)
@@ -350,14 +359,17 @@ class DetectionModel:
             or 0 if no match found
         """
         height, width = frame.shape[:2]
-        
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         # Convert to float32 and copy to device
-        frame_gpu = cuda.mem_alloc(frame.astype(np.float32).nbytes)
+        frame_flat = frame.astype(np.float32).reshape(-1)
+
+        frame_gpu = cuda.mem_alloc(frame_flat.nbytes)
         cuda.memcpy_htod(frame_gpu, frame.astype(np.float32).reshape(-1))
         
         # Copy reference colors to device
-        ref_colors_gpu = cuda.mem_alloc(self.reference_colors.nbytes)
-        cuda.memcpy_htod(ref_colors_gpu, self.reference_colors)
+        ref_colors_flat = self.reference_colors.flatten()
+        ref_colors_gpu = cuda.mem_alloc(ref_colors_flat.nbytes)
+        cuda.memcpy_htod(ref_colors_gpu, ref_colors_flat)
         
         # Allocate output array
         result = np.zeros(width * height, dtype=np.float32)
@@ -371,7 +383,8 @@ class DetectionModel:
         self.kernel(
             frame_gpu, ref_colors_gpu, result_gpu, 
             np.int32(width), np.int32(height),
-            np.int32(len(self.reference_colors)), np.float32(self.threshold),
+            np.int32(len(ref_colors_flat) // 3),  # Number of colors
+            np.float32(self.threshold),
             block=(block_size, 1, 1), grid=(grid_size, 1)
         )
         
@@ -379,7 +392,31 @@ class DetectionModel:
         cuda.memcpy_dtoh(result, result_gpu)
         
         # Reshape to 2D mask
-        return result.reshape(height, width)
+        mask = result.reshape(height, width)
+
+        # Count the number of valid detections
+        valid_mask = mask > 0
+        valid_color_detections = np.count_nonzero(valid_mask)
+
+        # Find a bounding box around the valid pixels
+        y_indices, x_indices = np.where(valid_mask)
+        if len(x_indices) > 0 and len(y_indices) > 0:
+            x_min, x_max = np.min(x_indices), np.max(x_indices)
+            y_min, y_max = np.min(y_indices), np.max(y_indices)
+            bbox = [x_min, y_min, x_max, y_max]
+        else:
+            bbox = [0, 0, 0, 0]
+
+        # Create a dictionary for color detections
+        colorDetections = {
+            "class": "Color Anomaly",
+            "mask": mask,
+            "num_detections": valid_color_detections,
+            "bbox": bbox,
+            "input_shape": frame.shape,
+        }
+
+        return colorDetections
     
     def preprocess(self, frame: np.ndarray) -> torch.Tensor:
         """
@@ -524,7 +561,7 @@ async def process_frames(detection_model: DetectionModel,
     """
     last_detection_time = 0
     detection_count = 0
-    
+    colorThreshold = detection_model.color_number_threshold
     logger.info(f"Starting frame processing with WebSocket: {websocket_uri}")
 
     # Get names and colors
@@ -569,35 +606,33 @@ async def process_frames(detection_model: DetectionModel,
                     valid_yolo_detections = [d for d in detections if d["confidence"] > Config.CONFIDENCE_THRESHOLD]
 
                     color_detections = detection_model.colorDetect(current_frame)
-                    # logger.info(f"Color detection result: {color_detections}")
-                    if color_detections.any():
-                        # Convert color detections to a mask
-                        # logger.info(f"Color detection result: {color_detections}")
-                        logger.info(f"Color detection result: {np.argwhere(color_detections > 0)}")
-                    valid_color_detections = [d for d in color_detections if d > 0]
-                    logger.info(f"Frame Processed: {len(valid_yolo_detections)} YOLO detections, {len(valid_color_detections)} color detections")
+                    
+                    
+                    logger.info(f"Frame Processed: {len(valid_yolo_detections)} YOLO detections, {color_detections['num_detections']} color detections")
                    
-                    if valid_yolo_detections | valid_color_detections>5:
+                    if valid_yolo_detections or color_detections["num_detections"] > colorThreshold:
+                        annotated_frame = current_frame.copy()
+
+                        # Draw YOLO detection bounding box if available
+                        if valid_yolo_detections:
+                            # Take the highest confidence detection
+                            detection = max(valid_yolo_detections, key=lambda x: x["confidence"])
+                            detection_count += 1
+                            annotated_frame = draw_detection(annotated_frame, detection, [720, 1280, 3])
+                            logger.info(f"Detection sent: {detections[0]['class']} ({detections[0]['confidence']:.2f})")
+                        # Draw color detection bounding box if available
+                        if color_detections["num_detections"] > colorThreshold:
+                            detection_count += 1
+                            annotated_frame = draw_detection(annotated_frame, color_detections, [720, 1280, 3])
                         
-                        # Take the highest confidence detection
-                        detection = max(valid_yolo_detections, key=lambda x: x["confidence"])
-                        # Save the image with detection
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        detection_count += 1
-                        image_filename = f"detection_{timestamp}_{detection_count:04d}.jpg"
-                        image_path = str(Config.DETECTION_DIR / image_filename)
-                        # Draw bounding box on frame copy for saving
-                        annotated_frame = draw_detection(current_frame.copy(), detection, [720,1280,3])
                         imageUrl = img_to_base64_string(annotated_frame)
                         # Send detection via websocket
-                        # print("Sending Websocket")
                         await send_json(ws_client,
                                         {"action": "NewAlert", "args": 
                                             {"event": "alert", "image": imageUrl}})
                         # cv2.imshow("RTSP Stream", annotated_frame)
                         # Update last detection time
                         last_detection_time = current_time
-                        logger.info(f"Detection sent: {detections[0]['class']} ({detections[0]['confidence']:.2f})")
                     else:
                         logger.info("No valid detections found")
                         # cv2.imshow("RTSP Stream", current_frame)
