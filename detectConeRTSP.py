@@ -48,13 +48,13 @@ class Config:
     # WebSocket settings
     WEBSOCKET_URI = "ws://192.168.0.101:8085"
     WS_PING_INTERVAL = 20
-    WS_PING_TIMEOUT = 20
+    WS_PING_TIMEOUT = 200
     WS_RECONNECT_DELAY = 2
     
     # Detection settings
     MODEL_PATH = "coneslayer-deluxe.pt"
     CONFIDENCE_THRESHOLD = 0.5
-    DETECTION_COOLDOWN = 1.0  # seconds
+    DETECTION_COOLDOWN = 2.0  # seconds
     
     # Output settings
     DETECTION_DIR = Path("detections")
@@ -144,9 +144,10 @@ def rtsp_reader(rtsp_url: str, frame_queue: queue.Queue, stop_event: threading.E
         logger.warning(f"GStreamer error: {e}, falling back to standard capture")
         cap = cv2.VideoCapture(rtsp_url)
     
-    if not cap.isOpened():
+    while not cap.isOpened():
         logger.error(f"Failed to open RTSP stream: {rtsp_url}")
-        return
+        time.sleep(5)
+        cap = cv2.VideoCapture(rtsp_url)
     
     # Set capture properties for performance
     # cap.set(cv2.CAP_PROP_BUFFERSIZE, 5)
@@ -219,14 +220,15 @@ class DetectionModel:
         self.conf_threshold = conf_threshold
         self.imgsz = 1280  # Default image size
         self.iou_thres = 0.50
-        self.color_number_threshold = 5
+        self.color_number_threshold = 1
         self.reference_colors = np.array([
             (248, 113, 84),
             (241, 67, 60),
             (248, 43, 16),
             (252, 64, 29),
             (185, 39, 42),
-            (255, 134, 106)], dtype=np.float32)
+            (255, 134, 106),
+            (187, 71, 72)], dtype=np.float32)
         self.threshold = 20.0
         logger.info(f"Loading detection model from {model_path}")
         
@@ -237,6 +239,7 @@ class DetectionModel:
                 # Load model
                 
                 self.model = attempt_load(model_path, map_location=DEVICE)  # load FP32 model
+                self.model = TracedModel(self.model, DEVICE, self.imgsz)
                 stride = int(self.model.stride.max())  # model stride
                 imgsz = check_img_size(self.imgsz, s=stride)  # check img_size
                 self.model.eval()
@@ -572,82 +575,82 @@ async def process_frames(detection_model: DetectionModel,
     # cv2.namedWindow("RTSP Stream", cv2.WINDOW_NORMAL)
     
     while not stop_event.is_set():
-        # try:
-        # Connect with configured ping settings
-        async with websockets.connect(
-            websocket_uri,
-            ping_interval=Config.WS_PING_INTERVAL,
-            ping_timeout=Config.WS_PING_TIMEOUT
-        ) as ws_client:
-            logger.info("WebSocket connection established")
-            
-            while not stop_event.is_set():
-                try:
-                    # Get the latest frame from the queue
-                    try:
-                        current_frame = frame_queue.get_nowait()
-                    except queue.Empty:
-                        # No frame available, wait briefly
-                        logger.info("No frame available, waiting...")
-                        await asyncio.sleep(0.1)
-                        continue
-                    
-                    # Current time for cooldown check
-                    current_time = time.time()
-                    
-                    # Skip detection if we're in cooldown period
-                    if current_time - last_detection_time < Config.DETECTION_COOLDOWN:
-                        await asyncio.sleep(0.001)
-                        continue
-                    
-                    # Run detections
-                    detections = detection_model.detect(current_frame)
-                     # Filter by confidence (already done in the model, but just in case)
-                    valid_yolo_detections = [d for d in detections if d["confidence"] > Config.CONFIDENCE_THRESHOLD]
-
-                    color_detections = detection_model.colorDetect(current_frame)
-                    
-                    
-                    logger.info(f"Frame Processed: {len(valid_yolo_detections)} YOLO detections, {color_detections['num_detections']} color detections")
-                   
-                    if valid_yolo_detections or color_detections["num_detections"] > colorThreshold:
-                        annotated_frame = current_frame.copy()
-
-                        # Draw YOLO detection bounding box if available
-                        if valid_yolo_detections:
-                            # Take the highest confidence detection
-                            detection = max(valid_yolo_detections, key=lambda x: x["confidence"])
-                            detection_count += 1
-                            annotated_frame = draw_detection(annotated_frame, detection, [720, 1280, 3])
-                            logger.info(f"Detection sent: {detections[0]['class']} ({detections[0]['confidence']:.2f})")
-                        # Draw color detection bounding box if available
-                        if color_detections["num_detections"] > colorThreshold:
-                            detection_count += 1
-                            annotated_frame = draw_detection(annotated_frame, color_detections, [720, 1280, 3])
-                        
-                        imageUrl = img_to_base64_string(annotated_frame)
-                        # Send detection via websocket
-                        await send_json(ws_client,
-                                        {"action": "NewAlert", "args": 
-                                            {"event": "alert", "image": imageUrl}})
-                        # cv2.imshow("RTSP Stream", annotated_frame)
-                        # Update last detection time
-                        last_detection_time = current_time
-                    else:
-                        logger.info("No valid detections found")
-                        # cv2.imshow("RTSP Stream", current_frame)
-                        # pass
-                        
-                    # Minimal sleep for event loop to process other tasks
-                    await asyncio.sleep(0.001)
+        try:
+            # Connect with configured ping settings
+            async with websockets.connect(
+                websocket_uri,
+                ping_interval=Config.WS_PING_INTERVAL,
+                ping_timeout=Config.WS_PING_TIMEOUT
+            ) as ws_client:
+                logger.info("WebSocket connection established")
                 
-                    
-                except websockets.exceptions.ConnectionClosedError as e:
-                    logger.warning(f"WebSocket connection lost: {e}, reconnecting...")
-                    break
+                while not stop_event.is_set():
+                    try:
+                        # Get the latest frame from the queue
+                        try:
+                            current_frame = frame_queue.get_nowait()
+                        except queue.Empty:
+                            # No frame available, wait briefly
+                            logger.info("No frame available, waiting...")
+                            await asyncio.sleep(0.15)
+                            continue
                         
-        # except Exception as e:
-        #     logger.error(f"Connection error: {e}")
+                        # Current time for cooldown check
+                        current_time = time.time()
+                        
+                        # Skip detection if we're in cooldown period
+                        if current_time - last_detection_time < Config.DETECTION_COOLDOWN:
+                            await asyncio.sleep(0.001)
+                            continue
+                        
+                        # Run detections
+                        detections = detection_model.detect(current_frame)
+                        # Filter by confidence (already done in the model, but just in case)
+                        valid_yolo_detections = [d for d in detections if d["confidence"] > Config.CONFIDENCE_THRESHOLD]
+
+                        color_detections = detection_model.colorDetect(current_frame)
+                        
+                        
+                        logger.info(f"Frame Processed: {len(valid_yolo_detections)} YOLO detections, {color_detections['num_detections']} color detections")
+                    
+                        if valid_yolo_detections or color_detections["num_detections"] > colorThreshold:
+                            annotated_frame = current_frame.copy()
+
+                            # Draw YOLO detection bounding box if available
+                            if valid_yolo_detections:
+                                # Take the highest confidence detection
+                                detection = max(valid_yolo_detections, key=lambda x: x["confidence"])
+                                detection_count += 1
+                                annotated_frame = draw_detection(annotated_frame, detection, [720, 1280, 3])
+                                logger.info(f"Detection sent: {detections[0]['class']} ({detections[0]['confidence']:.2f})")
+                            # Draw color detection bounding box if available
+                            if color_detections["num_detections"] > colorThreshold:
+                                detection_count += 1
+                                annotated_frame = draw_detection(annotated_frame, color_detections, [720, 1280, 3])
+                            
+                            imageUrl = img_to_base64_string(annotated_frame)
+                            # Send detection via websocket
+                            await send_json(ws_client,
+                                            {"action": "NewAlert", "args": 
+                                                {"event": "alert", "image": imageUrl}})
+                            # cv2.imshow("RTSP Stream", annotated_frame)
+                            # Update last detection time
+                            last_detection_time = current_time
+                        else:
+                            logger.info("No valid detections found")
+                            # cv2.imshow("RTSP Stream", current_frame)
+                            # pass
+                            
+                        # Minimal sleep for event loop to process other tasks
+                        await asyncio.sleep(0.001)
+                    
+                        
+                    except websockets.exceptions.ConnectionClosedError as e:
+                        logger.warning(f"WebSocket connection lost: {e}, reconnecting...")
+                        break
+                            
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
         
         # Wait before attempting reconnection if not stopping
         if not stop_event.is_set():
